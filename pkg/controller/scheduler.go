@@ -31,60 +31,71 @@ import (
 	"github.com/fluxcd/flagger/pkg/router"
 )
 
-func (c *Controller) min(a int, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func (c *Controller) maxWeight(canary *flaggerv1.Canary) int {
-	var stepWeightsLen = len(canary.GetAnalysis().StepWeights)
-	if stepWeightsLen > 0 {
-		return c.min(c.totalWeight(canary), canary.GetAnalysis().StepWeights[stepWeightsLen-1])
-	}
-	if canary.GetAnalysis().MaxWeight > 0 {
-		return canary.GetAnalysis().MaxWeight
-	}
-	// set max weight default value to total weight
-	return c.totalWeight(canary)
-}
-
 func (c *Controller) totalWeight(canary *flaggerv1.Canary) int {
 	// set total weight default value to 100%
-	return 100
+	return totalTrafficWeight
 }
 
-func (c *Controller) nextStepWeight(canary *flaggerv1.Canary, canaryWeight int) int {
-	var stepWeightsLen = len(canary.GetAnalysis().StepWeights)
-	if canary.GetAnalysis().StepWeight > 0 || stepWeightsLen == 0 {
-		return canary.GetAnalysis().StepWeight
+// weightConfigHasStep reports whether the analysis has a traffic step to apply.
+// Without a positive step the progressive traffic strategy has nothing to do.
+func weightConfigHasStep(cfg WeightConfig) bool {
+	return cfg.StepWeight > 0 || len(cfg.StepWeights) > 0
+}
+
+// rejectInvalidWeightConfig stops the analysis when the traffic weight
+// configuration cannot be executed. The canary status has no free-form message
+// field, so the reason is reported as an error event and the rollout is marked
+// failed with all traffic back on the primary. It returns true when the weight
+// configuration was rejected.
+func (c *Controller) rejectInvalidWeightConfig(cd *flaggerv1.Canary, canaryController canary.Controller,
+	meshRouter router.Interface) bool {
+	// only the analysis phases use the weight configuration; once traffic is
+	// shifting back to the primary it must not jump
+	if cd.Status.Phase != flaggerv1.CanaryPhaseProgressing &&
+		cd.Status.Phase != flaggerv1.CanaryPhaseWaiting {
+		return false
 	}
 
-	totalWeight := c.totalWeight(canary)
-	maxStep := totalWeight - canaryWeight
-
-	// If maxStep is zero we need to promote, so any non zero step weight will move the canary to promotion.
-	// This is the same use case as the last step via StepWeight.
-	if maxStep == 0 {
-		return 1
+	if cd.GetAnalysis() == nil || cd.SkipAnalysis() ||
+		cd.DeploymentStrategy() != flaggerv1.DeploymentStrategyCanary {
+		return false
 	}
 
-	// return min of maxStep and the calculated step to avoid going above totalWeight
-
-	// initial step
-	if canaryWeight == 0 {
-		return c.min(maxStep, canary.GetAnalysis().StepWeights[0])
+	errs, _ := ValidateWeightConfig(WeightConfigFromAnalysis(cd.GetAnalysis()))
+	if len(errs) == 0 {
+		return false
 	}
 
-	// find the current step and return the difference in weight
-	for i := 0; i < stepWeightsLen-1; i++ {
-		if canary.GetAnalysis().StepWeights[i] == canaryWeight {
-			return c.min(maxStep, canary.GetAnalysis().StepWeights[i+1]-canaryWeight)
-		}
+	for _, err := range errs {
+		c.recordEventErrorf(cd, "Invalid analysis configuration: %v", err)
 	}
 
-	return maxStep
+	// stop advancing: keep all traffic on the primary and mark the rollout failed
+	if err := meshRouter.SetRoutes(cd, c.totalWeight(cd), 0, false); err != nil {
+		c.recordEventWarningf(cd, "%v", err)
+		return true
+	}
+	c.recorder.SetWeight(cd, c.totalWeight(cd), 0)
+	if err := canaryController.SetStatusPhase(cd, flaggerv1.CanaryPhaseFailed); err != nil {
+		c.recordEventWarningf(cd, "%v", err)
+	}
+	c.recorder.SetStatus(cd, flaggerv1.CanaryPhaseFailed)
+	return true
+}
+
+// reportWeightConfigWarnings emits one warning event per executable but
+// suspicious weight configuration setting. It runs once per rollout, right
+// before the analysis starts, so the number of warnings is stable.
+func (c *Controller) reportWeightConfigWarnings(cd *flaggerv1.Canary) {
+	if cd.GetAnalysis() == nil ||
+		cd.DeploymentStrategy() != flaggerv1.DeploymentStrategyCanary {
+		return
+	}
+
+	_, warnings := ValidateWeightConfig(WeightConfigFromAnalysis(cd.GetAnalysis()))
+	for _, warning := range warnings {
+		c.recordEventWarningf(cd, "Analysis configuration warning: %s", warning)
+	}
 }
 
 // scheduleCanaries synchronises the canary map with the jobs map,
@@ -289,7 +300,11 @@ func (c *Controller) advanceCanary(name string, namespace string) {
 		return
 	}
 
-	maxWeight := c.maxWeight(cd)
+	// reject traffic weight configurations that cannot be executed before any
+	// traffic is moved
+	if c.rejectInvalidWeightConfig(cd, canaryController, meshRouter) {
+		return
+	}
 
 	// check primary status
 	if !cd.SkipAnalysis() {
@@ -449,6 +464,7 @@ func (c *Controller) advanceCanary(name string, namespace string) {
 	if canaryWeight == 0 && cd.Status.Iterations == 0 &&
 		!(cd.GetAnalysis().Mirror && mirrored) {
 		c.recordEventInfof(cd, "Starting canary analysis for %s.%s", cd.Spec.TargetRef.Name, cd.Namespace)
+		c.reportWeightConfigWarnings(cd)
 
 		// run pre-rollout web hooks
 		if ok := c.runPreRolloutHooks(cd); !ok {
@@ -490,7 +506,8 @@ func (c *Controller) advanceCanary(name string, namespace string) {
 	}
 
 	// strategy: Canary progressive traffic increase
-	if c.nextStepWeight(cd, canaryWeight) > 0 {
+	cfg := WeightConfigFromAnalysis(cd.GetAnalysis())
+	if weightConfigHasStep(cfg) {
 		// run hook only if traffic is not mirrored
 		if !mirrored &&
 			(cd.Status.Phase != flaggerv1.CanaryPhasePromoting &&
@@ -500,7 +517,11 @@ func (c *Controller) advanceCanary(name string, namespace string) {
 				return
 			}
 		}
-		c.runCanary(cd, canaryController, meshRouter, mirrored, canaryWeight, primaryWeight, maxWeight)
+		c.runCanary(cd, canaryController, meshRouter, WeightState{
+			PrimaryWeight: primaryWeight,
+			CanaryWeight:  canaryWeight,
+			Mirrored:      mirrored,
+		}, cfg)
 	}
 
 }
@@ -515,14 +536,17 @@ func (c *Controller) runPromotionTrafficShift(canary *flaggerv1.Canary, canaryCo
 		return
 	}
 
+	cfg := WeightConfigFromAnalysis(canary.GetAnalysis())
+
 	// route all traffic to primary in one go when promotion step wight is not set
-	if canary.Spec.Analysis.StepWeightPromotion == 0 {
+	if cfg.StepWeightPromotion <= 0 {
 		c.recordEventInfof(canary, "Routing all traffic to primary")
-		if err := meshRouter.SetRoutes(canary, c.totalWeight(canary), 0, false); err != nil {
+		decision := NextPromotionWeight(cfg, primaryWeight, canaryWeight)
+		if err := meshRouter.SetRoutes(canary, decision.PrimaryWeight, decision.CanaryWeight, false); err != nil {
 			c.recordEventWarningf(canary, "%v", err)
 			return
 		}
-		c.recorder.SetWeight(canary, c.totalWeight(canary), 0)
+		c.recorder.SetWeight(canary, decision.PrimaryWeight, decision.CanaryWeight)
 		if err := canaryController.SetStatusPhase(canary, flaggerv1.CanaryPhaseFinalising); err != nil {
 			c.recordEventWarningf(canary, "%v", err)
 		}
@@ -531,28 +555,21 @@ func (c *Controller) runPromotionTrafficShift(canary *flaggerv1.Canary, canaryCo
 
 	// increment the primary traffic weight until it reaches total weight
 	if canaryWeight > 0 {
-		primaryWeight += canary.GetAnalysis().StepWeightPromotion
-		if primaryWeight > c.totalWeight(canary) {
-			primaryWeight = c.totalWeight(canary)
-		}
-		canaryWeight -= canary.GetAnalysis().StepWeightPromotion
-		if canaryWeight < 0 {
-			canaryWeight = 0
-		}
-		if err := meshRouter.SetRoutes(canary, primaryWeight, canaryWeight, false); err != nil {
+		decision := NextPromotionWeight(cfg, primaryWeight, canaryWeight)
+		if err := meshRouter.SetRoutes(canary, decision.PrimaryWeight, decision.CanaryWeight, false); err != nil {
 			c.recordEventWarningf(canary, "%v", err)
 			return
 		}
-		c.recorder.SetWeight(canary, primaryWeight, canaryWeight)
-		c.recordEventInfof(canary, "Advance %s.%s primary weight %v", canary.Name, canary.Namespace, primaryWeight)
+		c.recorder.SetWeight(canary, decision.PrimaryWeight, decision.CanaryWeight)
+		c.recordEventInfof(canary, "Advance %s.%s primary weight %v", canary.Name, canary.Namespace, decision.PrimaryWeight)
 
 		// finalize promotion
-		if primaryWeight == c.totalWeight(canary) {
+		if decision.Finalise {
 			if err := canaryController.SetStatusPhase(canary, flaggerv1.CanaryPhaseFinalising); err != nil {
 				c.recordEventWarningf(canary, "%v", err)
 			}
 		} else {
-			if err := canaryController.SetStatusWeight(canary, canaryWeight); err != nil {
+			if err := canaryController.SetStatusWeight(canary, decision.CanaryWeight); err != nil {
 				c.recordEventWarningf(canary, "%v", err)
 			}
 		}
@@ -563,58 +580,38 @@ func (c *Controller) runPromotionTrafficShift(canary *flaggerv1.Canary, canaryCo
 }
 
 func (c *Controller) runCanary(canary *flaggerv1.Canary, canaryController canary.Controller,
-	meshRouter router.Interface, mirrored bool, canaryWeight int, primaryWeight int, maxWeight int) {
+	meshRouter router.Interface, state WeightState, cfg WeightConfig) {
 	primaryName := fmt.Sprintf("%s-primary", canary.Spec.TargetRef.Name)
 
+	decision := NextAnalysisWeight(cfg, state)
+
 	// increase traffic weight
-	if canaryWeight < maxWeight {
+	if decision.Kind != WeightStepPromote {
 		// If in "mirror" mode, do one step of mirroring before shifting traffic to canary.
 		// When mirroring, all requests go to primary and canary, but only responses from
 		// primary go back to the user.
-
-		var nextStepWeight int
-		nextStepWeight = c.nextStepWeight(canary, canaryWeight)
-		if canary.GetAnalysis().Mirror && canaryWeight == 0 {
-			if !mirrored {
-				mirrored = true
-				primaryWeight = c.totalWeight(canary)
-				canaryWeight = 0
-			} else {
-				mirrored = false
-				primaryWeight = c.totalWeight(canary) - nextStepWeight
-				canaryWeight = nextStepWeight
-			}
+		if decision.Kind == WeightStepMirror {
 			c.logger.With("canary", fmt.Sprintf("%s.%s", canary.Name, canary.Namespace)).
-				Infof("Running mirror step %d/%d/%t", primaryWeight, canaryWeight, mirrored)
-		} else {
-
-			primaryWeight -= nextStepWeight
-			if primaryWeight < 0 {
-				primaryWeight = 0
-			}
-			canaryWeight += nextStepWeight
-			if canaryWeight > c.totalWeight(canary) {
-				canaryWeight = c.totalWeight(canary)
-			}
+				Infof("Running mirror step %d/%d/%t", decision.PrimaryWeight, decision.CanaryWeight, decision.Mirrored)
 		}
 
-		if err := meshRouter.SetRoutes(canary, primaryWeight, canaryWeight, mirrored); err != nil {
+		if err := meshRouter.SetRoutes(canary, decision.PrimaryWeight, decision.CanaryWeight, decision.Mirrored); err != nil {
 			c.recordEventWarningf(canary, "%v", err)
 			return
 		}
 
-		if err := canaryController.SetStatusWeight(canary, canaryWeight); err != nil {
+		if err := canaryController.SetStatusWeight(canary, decision.CanaryWeight); err != nil {
 			c.recordEventWarningf(canary, "%v", err)
 			return
 		}
 
-		c.recorder.SetWeight(canary, primaryWeight, canaryWeight)
-		c.recordEventInfof(canary, "Advance %s.%s canary weight %v", canary.Name, canary.Namespace, canaryWeight)
+		c.recorder.SetWeight(canary, decision.PrimaryWeight, decision.CanaryWeight)
+		c.recordEventInfof(canary, "Advance %s.%s canary weight %v", canary.Name, canary.Namespace, decision.CanaryWeight)
 		return
 	}
 
 	// promote canary - max weight reached
-	if canaryWeight >= maxWeight {
+	if decision.Kind == WeightStepPromote {
 		// check promotion gate
 		if promote := c.runConfirmPromotionHooks(canary, canaryController); !promote {
 			return

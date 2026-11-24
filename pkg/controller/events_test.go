@@ -104,13 +104,13 @@ func TestWebhooks(t *testing.T) {
 					{Phase: flaggerv1.CanaryPhaseInitialized, Metadata: map[string]string{"eventMessage": "Confirm-rollout check confirm-rollout-webhook passed"}},
 					{Phase: flaggerv1.CanaryPhaseProgressing, Metadata: map[string]string{"eventMessage": "New revision detected! Scaling up podinfo.default"}},
 					{Phase: flaggerv1.CanaryPhaseProgressing, Metadata: map[string]string{"eventMessage": "Starting canary analysis for podinfo.default"}},
+					{Phase: flaggerv1.CanaryPhaseProgressing, Metadata: map[string]string{"eventMessage": "Analysis configuration warning: stepWeight 100 is greater than maxWeight 50, the first step will be truncated to maxWeight"}},
 					{Phase: flaggerv1.CanaryPhaseProgressing, Metadata: map[string]string{"eventMessage": "Pre-rollout check pre-rollout-webhook passed"}},
 					{Phase: flaggerv1.CanaryPhaseProgressing, Metadata: map[string]string{"eventMessage": "Confirm-traffic-increase check confirm-traffic-increase-webhook passed"}},
-					{Phase: flaggerv1.CanaryPhaseProgressing, Metadata: map[string]string{"eventMessage": "Advance podinfo.default canary weight 100"}},
+					{Phase: flaggerv1.CanaryPhaseProgressing, Metadata: map[string]string{"eventMessage": "Advance podinfo.default canary weight 50"}},
 					{Phase: flaggerv1.CanaryPhaseProgressing, Metadata: map[string]string{"eventMessage": "Confirm-traffic-increase check confirm-traffic-increase-webhook passed"}},
 					{Phase: flaggerv1.CanaryPhaseProgressing, Metadata: map[string]string{"eventMessage": "Confirm-promotion check confirm-promotion-webhook passed"}},
 					{Phase: flaggerv1.CanaryPhaseProgressing, Metadata: map[string]string{"eventMessage": "Copying podinfo.default template spec to podinfo-primary.default"}},
-					{Phase: flaggerv1.CanaryPhasePromoting, Metadata: map[string]string{"eventMessage": "Advance podinfo.default primary weight 50"}},
 					{Phase: flaggerv1.CanaryPhasePromoting, Metadata: map[string]string{"eventMessage": "Advance podinfo.default primary weight 100"}},
 					{Phase: flaggerv1.CanaryPhaseSucceeded, Metadata: map[string]string{"eventMessage": "Post-rollout check post-rollout-webhook passed"}},
 					{Phase: flaggerv1.CanaryPhaseSucceeded, Metadata: map[string]string{"eventMessage": "Promotion completed! Scaling down podinfo.default"}},
@@ -170,11 +170,8 @@ func TestWebhooks(t *testing.T) {
 				mocks.ctrl.advanceCanary("podinfo", "default")
 				require.NoError(t, assertPhase(mocks.flaggerClient, "podinfo", flaggerv1.CanaryPhasePromoting))
 
-				// end promotion
-				mocks.ctrl.advanceCanary("podinfo", "default")
-				require.NoError(t, assertPhase(mocks.flaggerClient, "podinfo", flaggerv1.CanaryPhasePromoting))
-
-				// finalising
+				// end promotion: the promotion step takes the primary from 50
+				// straight to 100, so this cycle finalises the promotion
 				mocks.ctrl.advanceCanary("podinfo", "default")
 				require.NoError(t, assertPhase(mocks.flaggerClient, "podinfo", flaggerv1.CanaryPhaseFinalising))
 

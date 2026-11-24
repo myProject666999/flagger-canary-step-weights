@@ -133,12 +133,13 @@ spec:
     stepWeight: 20
 ```
 
-This configuration performs analysis starting from 20, increasing by 20 until weight goes above 50.  
+This configuration performs analysis starting from 20, increasing by 20 until the weight
+reaches `maxWeight`. The last step is truncated so the canary weight never exceeds `maxWeight`.
 We would have steps (canary weight : primary weight):
 
 * 20 (20 : 80)
 * 40 (40 : 60)
-* 60 (60 : 40)
+* 50 (50 : 50)
 * promotion
 
 In order to enable non-linear promotion a new parameter was introduced:
@@ -162,6 +163,32 @@ We would have steps (canary weight : primary weight):
 * 10 (10 : 90)
 * 80 (80 : 20)
 * promotion
+
+When `stepWeights` is set, the last entry is the effective maximum weight and `maxWeight`
+is ignored. If both are set and disagree, Flagger reports a configuration warning and uses the
+last `stepWeights` entry.
+
+If the canary weight observed on the router does not match a configured step (for example
+because the mesh rounded the weight, the route object was edited by hand, or `stepWeights`
+was changed mid-analysis), Flagger takes the first configured step strictly above the current
+weight. The canary weight never decreases and never exceeds the effective maximum weight.
+If no configured step is above the current weight, the rollout is promoted.
+
+#### Weight configuration validation
+
+The following values cannot be executed and stop the rollout with an error event:
+
+* `stepWeight` or a `stepWeights` entry that is negative or greater than 100
+* `stepWeights` that is not strictly increasing (zero, duplicates and descending entries)
+* a negative `stepWeightPromotion` or one greater than 100
+* neither `stepWeight` nor `stepWeights` set to a positive value
+
+The following values are executable but are most likely not what was intended, and produce a
+warning event once per rollout:
+
+* `stepWeight` that does not evenly divide `maxWeight` (the last step is truncated)
+* `stepWeight` greater than `maxWeight` (the first step is truncated)
+* `stepWeights` set together with a different `maxWeight` (the last `stepWeights` entry wins)
 
 ## A/B Testing
 

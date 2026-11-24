@@ -32,7 +32,9 @@ const (
 )
 
 func TestScheduler_ServicePromotion(t *testing.T) {
-	testServicePromotion(t, newTestServiceCanary(), []int{totalWeight, 80, 60, 40})
+	// stepWeight 20 with maxWeight 50 now stops at the maxWeight ceiling:
+	// 20, 40, 50 instead of 20, 40, 60.
+	testServicePromotion(t, newTestServiceCanary(), []int{totalWeight, 80, 60, 50})
 }
 
 func TestScheduler_ServicePromotionMaxWeight(t *testing.T) {
@@ -43,8 +45,41 @@ func TestScheduler_ServicePromotionWithWeightsHappyCase(t *testing.T) {
 	testServicePromotion(t, newTestServiceCanaryWithWeightsHappyCase(), []int{totalWeight, 99, 98, 90, 20})
 }
 
+// A stepWeights entry above the total traffic weight cannot be executed. The
+// rollout is rejected before any traffic is shifted instead of advancing to an
+// unroutable weight.
 func TestScheduler_ServicePromotionWithWeightsOverflow(t *testing.T) {
-	testServicePromotion(t, newTestServiceCanaryWithWeightsOverflow(), []int{totalWeight, 99, 98, 90, 0})
+	// keep the canary alive so the failure is due to the weight configuration
+	// and not a missing workload
+	mocks := newDeploymentFixture(newTestServiceCanaryWithWeightsOverflow())
+
+	// init
+	mocks.ctrl.advanceCanary("podinfo", "default")
+
+	c, err := mocks.flaggerClient.FlaggerV1beta1().Canaries("default").Get(context.TODO(), "podinfo", metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, flaggerv1.CanaryPhaseInitialized, c.Status.Phase)
+
+	// update
+	svc2 := newDeploymentTestServiceV2()
+	_, err = mocks.kubeClient.CoreV1().Services("default").Update(context.TODO(), svc2, metav1.UpdateOptions{})
+	require.NoError(t, err)
+
+	// detect changes, then advance into the analysis phase
+	for i := 0; i < 3; i++ {
+		mocks.ctrl.advanceCanary("podinfo", "default")
+	}
+
+	// the invalid weight configuration stops the rollout
+	c, err = mocks.flaggerClient.FlaggerV1beta1().Canaries("default").Get(context.TODO(), "podinfo", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, flaggerv1.CanaryPhaseFailed, c.Status.Phase)
+
+	primaryWeight, canaryWeight, mirrored, err := mocks.router.GetRoutes(mocks.canary)
+	require.NoError(t, err)
+	assert.Equal(t, totalWeight, primaryWeight)
+	assert.Equal(t, 0, canaryWeight)
+	assert.False(t, mirrored)
 }
 
 func testServicePromotion(t *testing.T, canary *flaggerv1.Canary, expectedPrimaryWeigths []int) {
